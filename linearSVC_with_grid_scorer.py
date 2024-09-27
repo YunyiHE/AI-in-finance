@@ -1,0 +1,374 @@
+"""
+In this homework you will implement a multi-class classifier.
+Multi-class classifiers are a little trickier to evaluate than binary classifiers.
+To understand the scoring for multi-class classifiers you need to read ModelEvaluation.pdf
+ModelEvaluation.pdf explains the various scorings used to evaluate classifiers but
+concentrate on just two: accuracy and the F1 score.
+
+When you convert a target from continuous to categorical,
+you lose some information in the target variable.
+It works a little like filtering or removing noise from a variable.
+
+But:    
+If you covert a target to a binary variable,
+you lose more information than 
+if you convert it to a ternary variable or an n-ary variable.
+
+So there is a sweet spot where you lose just the right type and amount of information from the target.
+But:
+It is not possible to know in advance where the sweetspot occurs,
+with the binary target or with the ternary target or even 
+with the choice to use regression instead of classification.
+
+So it is a good idea to try both types of classification, binary and multi-class.
+
+Selecting a scorer for multi-class classifier is a bit trickier than 
+for a binary classifier.
+
+There is no "best" scorer that everybody agrees on but
+some scorers are affected by the number of samples in each target class and
+some are not; specifically,
+some scorers are affected by the lack of balance among the sizes of the target classes and
+some are not.
+
+Accuracy is a favorite scorer for classifiers, but it requires the target classes to be balanced.
+If you correct the lack of balance using weights, you must calculate the weights using only the training data,
+but that means that the model's dependence on the fortuitous training selection increases:
+the model already uses the training data to train, and now
+the model uses the training data again to calculate the balancing weights.
+This double dependence could lead to overfitting so 
+if a model uses accuracy (or "f1_weighted" for the same reason) it needs to tune the weights often with new data.
+This matters little if you plan to retrain the model frequently in any case.
+
+The favorite scorers for binary and multi-class classifiers are:
+
+accuracy: Balanced labels only. Use with class_weight='balanced'
+phi_k: Balanced or unbalanced labels. No need for class_weight='balanced'
+phi (matthews_corrcoef): Balanced or unbalanced. No need for class_weight='balanced'
+f1_macro: All label categories are equally important no matter their size. No need for class_weight="balanced"
+f1_weighted: Label categories are weighted by their size. No need for class_weight="balanced"
+
+
+Note on using phi_k for multi-class classifiers:
+phi_k is supposed to be better than phi (matthews_corrcoef), upon which it is based.
+But it is relatively new and so has not been tested too much in multi-class classifiers.
+
+"""
+
+import warnings
+warnings.simplefilter('ignore')
+
+import numpy as np
+import pandas as pd
+import fAux
+import matplotlib.pyplot as plt
+import seaborn as sns
+import talib as ta
+
+sns.set()
+
+#df = pd.read_csv('EURUSD_H3_200001030000_202107201800.csv', sep='\t')
+#df = pd.read_csv('GBPUSD_H3_200001030000_202107201800.csv', sep='\t')
+#df = pd.read_csv('NZDUSD_H3_200001030000_202107201800.csv', sep='\t')
+df = pd.read_csv('USDCAD_H3_200001030000_202107201800.csv', sep='\t')
+#df = pd.read_csv('USDCHF_H3_200001030000_202107201800.csv', sep='\t')
+
+df['<DATETIME>'] = pd.to_datetime(df['<DATE>'] + ' ' + df['<TIME>'])
+df = df.set_index('<DATETIME>')
+df.drop(['<TIME>'], axis=1, inplace=True)
+df.drop(['<DATE>'], axis=1, inplace=True)
+
+
+orig_cols = df.columns.values.tolist()
+
+#we are going to enter the trade at the next open, not wait till the next close
+#save the open for white reality check
+openp = df['<OPEN>'].copy()
+close = df['<CLOSE>'].copy()
+
+
+high = df['<HIGH>'].shift(1)
+low = df['<LOW>'].shift(1)
+close = df['<CLOSE>'].shift(1)
+
+
+n=10
+df['RSI']=ta.RSI(np.array(close), timeperiod=n)
+df['SMA'] = close.rolling(window=n).mean()
+df['Corr']= close.rolling(window=n).corr(df['SMA'])
+df['SAR']=ta.SAR(np.array(high),np.array(low), 0.2,0.2)
+df['ADX']=ta.ADX(np.array(high),np.array(low), np.array(df['<OPEN>']), timeperiod =n)
+df['OO']= df['<OPEN>']-df['<OPEN>'].shift(1)
+df['OC']= df['<OPEN>']-close
+df.fillna(0, inplace=True)
+
+##build day time features
+df["hour"] = df.index.hour.values
+df["day"] = df.index.dayofweek.values
+df_dummies_hour = pd.get_dummies(df["hour"], prefix='hour')
+df_dummies_day = pd.get_dummies(df["day"], prefix='day')
+df =df.join(df_dummies_hour)
+df=df.join(df_dummies_day)
+df.drop(["hour","day"], axis=1, inplace=True)
+
+#build target
+df['retFut1'] = df['<OPEN>'].pct_change(1).shift(-1).fillna(0) #if you enter the trade at the open
+#df['retFut1'] = df['<CLOSE>'].pct_change(1).shift(-1).fillna(0) #if you wait until the close to enter the trade
+
+
+#you have the option of a 3 label target or a 2 label target
+
+#3 label target gets better results
+df['label']=0
+df.loc[df['retFut1']>df['retFut1'][:10000].quantile(q=0.66),'label']=1
+df.loc[df['retFut1']<df['retFut1'][:10000].quantile(q=0.34),'label']=-1
+
+#2 label target
+#df['label']=0
+#df.loc[df['retFut1']>df['retFut1'][:10000].quantile(q=0.51),'label']=1
+
+#always check to see that the labels occur in equal numbers
+dfgroups = df.groupby("label").count() #if they do not, use "balanced" parameter (see below)
+
+#Preserve for calculations of system return
+retFut1 = df['retFut1'].copy()
+
+#build lags
+for n in list(range(0,15)):
+    name = 'lag_ret' + str(n)
+    df[name] =  df['<OPEN>'].pct_change(1).shift(n).fillna(0)
+
+#select the features (by dropping)
+orig_cols = ['<HIGH>', '<LOW>', '<CLOSE>', '<SPREAD>',  '<VOL>']#keep the open
+df.drop(orig_cols, axis=1, inplace=True)
+
+#distribute the df data into X inputs and y target
+X = df.drop(['retFut1','label'], axis=1)
+y = df[['label']]
+
+#select the samples
+x_train = X.iloc[0:10000]
+x_test = X.iloc[10000:12000]
+
+y_train = y.iloc[0:10000]
+y_test = y.iloc[10000:12000]
+
+retFut1_train = retFut1[0:10000]
+retFut1_test = retFut1[10000:12000]
+
+##########################################################################################################################
+#set up the grid search and fit
+
+from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.svm import LinearSVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score
+import phik
+from phik.report import plot_correlation_matrix
+from scipy.special import ndtr
+from sklearn.metrics import matthews_corrcoef
+from sklearn.metrics import make_scorer 
+from sklearn.inspection import permutation_importance
+import detrendPrice 
+import WhiteRealityCheckFor1 
+from sklearn.preprocessing import FunctionTransformer
+
+def phi_k(y_true, y_pred):
+    dfc = pd.DataFrame({'y_true': y_true, 'y_pred': y_pred})
+    try:
+        phi_k_corr = dfc.phik_matrix(interval_cols=[]).iloc[1,0]
+        phi_k_sig  = dfc.significance_matrix(interval_cols=[]).iloc[1,0]
+        phi_k_p_val = 1 - ndtr(phi_k_sig) 
+    except:
+        phi_k_corr = 0
+        phi_k_p_val = 0
+    #print(phi_k_corr)
+    print(phi_k_p_val)
+    return phi_k_corr
+
+#ph_k is supposed to be better than phi, provided here for comparison
+def phi(y_true, y_pred):
+    mcc = matthews_corrcoef(y_true,y_pred) #a.k.a. phi
+    print (mcc)
+    return mcc
+
+
+cols= x_train.columns
+ix_num=x_train.select_dtypes(exclude=['uint8']).columns
+ix_dum=x_train.select_dtypes(include=['uint8']).columns
+
+def select_scaler(x_train):
+        scaler = StandardScaler()
+        df = pd.DataFrame(x_train, columns=cols)
+        df_filtered = df[ix_num]
+        df_scaled = pd.DataFrame(scaler.fit_transform(df_filtered))
+        df_dummies = df[ix_dum]
+        df_scaled = df_scaled.join(df_dummies)
+        return df_scaled.values        
+
+#myscorer= "accuracy"  same as None; 
+#myscorer = None 
+#myscorer = make_scorer(phi_k, greater_is_better=True)
+#my_scorer="f1_macro" 
+#my_scorer="f1_weighted" 
+myscorer = make_scorer(phi, greater_is_better=True) 
+
+#we turn off scaling if using dummies (and returns are already mostly scaled)
+scaler = StandardScaler(with_mean=False, with_std=False) #will use select scaler
+
+custom_scaler = FunctionTransformer(select_scaler)
+
+svc = LinearSVC(class_weight='balanced') #to balance the label categories, if they do not occur in equal numbers
+
+pipe = Pipeline([("scaler", scaler), ("select_scaler", custom_scaler), ("svc", svc)])
+
+c_rs = np.linspace(0.001, 1, num=8, endpoint=True) #1 default
+
+#set of parameters for random search
+param_grid = {'svc__C': c_rs}
+
+grid_search = RandomizedSearchCV(pipe, param_grid, cv=5, scoring=myscorer, return_train_score=True)
+#grid_search = GridSearchCV(pipe, param_grid, cv=5, scoring=myscorer, return_train_score=True)
+
+grid_search.fit(x_train.values, y_train.values.ravel())
+
+best_parameters = grid_search.best_params_
+best_model = grid_search.best_estimator_
+
+
+print("Best parameters scaling grid: {}".format(best_parameters))
+#print('Best estimator {}'.format(best_model))
+print("Best cross-validation score scaling grid: {:.2f}".format(grid_search.best_score_*100))
+results = pd.DataFrame(grid_search.cv_results_)
+
+#print(results.T)
+results.to_csv("svrreggression_results.csv")
+
+
+#########################################################################################################################
+
+# Train set
+# Make "predictions" on training set (in-sample)
+positions = grid_search.predict(x_train.values)
+
+
+dailyRet = pd.Series(positions).fillna(0).values * retFut1_train
+dailyRet = dailyRet.fillna(0)
+
+cumret = np.cumprod(dailyRet + 1) - 1
+
+plt.figure(1)
+plt.plot(cumret.index, cumret)
+plt.title('Cross-validated SVRRegression on currency: train set')
+plt.ylabel('Cumulative Returns')
+plt.xlabel('Date')
+
+
+cagr = (1 + cumret[-1]) ** (252 / len(cumret)) - 1
+maxDD, maxDDD = fAux.calculateMaxDD(cumret)
+ratio = (252.0 ** (1.0/2.0)) * np.mean(dailyRet) / np.std(dailyRet)
+print (('In-sample: CAGR={:0.6} Sharpe ratio={:0.6} maxDD={:0.6} maxDDD={:d} Calmar ratio={:0.6}\n'\
+).format(cagr, ratio, maxDD, maxDDD.astype(int), -cagr/maxDD))
+
+# Test set
+# Make "predictions" on test set (out-of-sample)
+
+#positions2 = np.where(best_model.predict(x_test.values)> 0,1,-1 )
+positions2 = grid_search.predict(x_test.values)
+
+
+dailyRet2 = pd.Series(positions2).fillna(0).values * retFut1_test
+dailyRet2 = dailyRet2.fillna(0)
+
+cumret2 = np.cumprod(dailyRet2 + 1) - 1
+
+plt.figure(2)
+plt.plot(cumret2.index, cumret2)
+plt.title('Cross-validated SVRRegression on currency: test set')
+plt.ylabel('Cumulative Returns')
+plt.xlabel('Date')
+#plt.show()
+plt.savefig(r'Results\%s.png' %("Cumulative"))
+
+
+#metrics
+accuracy_score = accuracy_score(y_test.values.ravel(), grid_search.predict(x_test.values))
+
+#If this figure does not plot correctly select the lines and press F9 again
+arr1 = y_test.values.ravel()
+arr2 = grid_search.predict(x_test.values)
+dfc = pd.DataFrame({'y_true': arr1, 'y_pred': arr2})
+phi_k_corr = dfc.phik_matrix(interval_cols=[]).iloc[1,0]
+significance_overview = dfc.significance_matrix(interval_cols=[])
+phi_k_sig  = dfc.significance_matrix(interval_cols=[]).iloc[1,0]
+phi_k_p_val = 1 - ndtr(phi_k_sig) 
+plot_correlation_matrix(significance_overview.fillna(0).values, 
+                        x_labels=significance_overview.columns, 
+                        y_labels=significance_overview.index, 
+                        vmin=-5, vmax=5, title="Significance of the coefficients", 
+                        usetex=False, fontsize_factor=1.5, figsize=(7, 5))
+plt.tight_layout()
+#plt.show()
+plt.savefig(r'Results\%s.png' %("PhikSignificance"))
+
+cagr = (1 + cumret2[-1]) ** (252 / len(cumret2)) - 1
+maxDD, maxDDD = fAux.calculateMaxDD(cumret2)
+ratio = (252.0 ** (1.0/2.0)) * np.mean(dailyRet2) / np.std(dailyRet2)
+print (('Out-of-sample: CAGR={:0.6} Sharpe ratio={:0.6} maxDD={:0.6} maxDDD={:d} Calmar ratio={:0.6}  phi_k_corr={:0.6} phi_k_p_val={:0.6}  accuracy_score={:0.6}\n'\
+).format(cagr, ratio, maxDD, maxDDD.astype(int), -cagr/maxDD, phi_k_corr, phi_k_p_val, accuracy_score))
+
+
+#plot the residuals
+true_y = y_test.values.ravel()
+pred_y = grid_search.predict(x_test.values)
+residuals = np.subtract(true_y, pred_y)
+
+from scipy.stats import norm
+from statsmodels.graphics.tsaplots import plot_acf
+fig, axes = plt.subplots(ncols=2, figsize=(14,4))
+sns.distplot(residuals, fit=norm, ax=axes[0], axlabel='Residuals', label='Residuals')
+axes[0].set_title('Residual Distribution')
+axes[0].legend()
+plot_acf(residuals, lags=10, zero=False, ax=axes[1], title='Residual Autocorrelation')
+axes[1].set_xlabel('Lags')
+sns.despine()
+fig.tight_layout();
+#plt.show()
+plt.savefig(r'Results\%s.png' %("Residuals"))
+
+
+#Residual autocorrelation
+#If the p-value of the test is greater than the required significance (>0.05), residuals are independent
+import statsmodels.api as sm
+lb = sm.stats.acorr_ljungbox(residuals, lags=[10], boxpierce=False)
+print("Ljung-Box test p-value", lb[1])
+
+
+#white reality check
+detrended_open = detrendPrice.detrendPrice(openp[10000:12000])
+detrended_retFut1 = detrended_open.pct_change(periods=1).shift(-1).fillna(0)
+detrended_syst_rets = detrended_retFut1 * pd.Series(positions2).fillna(0)
+WhiteRealityCheckFor1.bootstrap(detrended_syst_rets)
+plt.show()
+
+"""
+RESULTS
+myscorer = None
+
+Out-of-sample: CAGR=0.0255775 Sharpe ratio=0.856594 maxDD=-0.0421592 maxDDD=449 Calmar ratio=0.606689  phi_k_corr=0.28406 phi_k_p_val=7.93495e-08  accuracy_score=0.374
+p_value:
+0.008000000000000007
+
+"""
+
+#plot the coefficients
+importance = pd.DataFrame(zip(best_model[2].coef_.ravel().tolist(), x_train.columns.values.tolist()))
+importance.columns = ['slope','feature_name']
+importance_plot = sns.barplot(x=importance['feature_name'], y=importance['slope'], data=importance,orient='v',dodge=False,order=importance.sort_values('slope',ascending=False).feature_name)
+for item in importance_plot.get_xticklabels(): #rotate the x labels by 90 degrees to avoid text overlapping
+    item.set_rotation(90)
+
+#plt.show()
+plt.savefig(r'Results\%s.png' %("Coefficients"))
